@@ -84,23 +84,33 @@ function findBulkInOutEndPoints(device) {
         endPointIn = endPoint;
         if (!claimed) {
           claimed = true;
+          if (interface.isKernelDriverActive()) {
+            try {
+              // Only required on linux to be able to claim
+              // the interface, otherwise a LIBUSB_ERROR_BUSY error
+              // is thrown
+              interface.detachKernelDriver();
+            } catch (e) {
+              // Throws failure on non-linux platforms
+            }
+          }
           interface.claim();
         }
       }
       if (endPoint.direction == "out" && !endPointOut) {
         endPointOut = endPoint;
-        if (interface.isKernelDriverActive()) {
-          try {
-            // Only required on linux to be able to claim
-            // the interface, otherwise a LIBUSB_ERROR_BUSY error
-            // is thrown
-            interface.detachKernelDriver();
-          } catch (e) {
-            // Throws failure on non-linux platforms
-          }
-        }
         if (!claimed) {
           claimed = true;
+          if (interface.isKernelDriverActive()) {
+            try {
+              // Only required on linux to be able to claim
+              // the interface, otherwise a LIBUSB_ERROR_BUSY error
+              // is thrown
+              interface.detachKernelDriver();
+            } catch (e) {
+              // Throws failure on non-linux platforms
+            }
+          }
           interface.claim();
         }
       }
@@ -448,10 +458,15 @@ ShizukuDevice.prototype = {
   async startSampling() {
     this.deviceName = this.deviceName.replace(/ in Application Mode$/, "");
 
-    try {
-      await resetDevice(this.device);
-    } catch(e) {
-      // resetDevice already logs the error.
+    // On Linux, detachKernelDriver() handles the cdc_acm conflict without a
+    // reset. A reset causes re-enumeration which fires a second 'attach' event
+    // and triggers a concurrent startSampling() call on the new handle.
+    if (process.platform !== 'linux') {
+      try {
+        await resetDevice(this.device);
+      } catch(e) {
+        // resetDevice already logs the error.
+      }
     }
 
     try {
@@ -1164,7 +1179,13 @@ function initialize() {
     tryDevice(device);
   });
   usb.on('detach', function(device) {
-    if (!(device.deviceDescriptor.idVendor in SUPPORTED_DEVICES)) {
+    const {idVendor, idProduct} = device.deviceDescriptor;
+    const isGenericMeter =
+      idVendor == GENERIC_VENDOR_ID &&
+      (SHIZUKU_PRODUCT_IDS.includes(idProduct) ||
+       FNIRSI_PRODUCT_IDS.includes(idProduct) ||
+       KINGMETER_PRODUCT_IDS.includes(idProduct));
+    if (!isGenericMeter && !(idVendor in SUPPORTED_DEVICES)) {
       return;
     }
 
