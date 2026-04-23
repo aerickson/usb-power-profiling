@@ -344,6 +344,12 @@ ShizukuDevice.prototype = {
   checksum(data) { return data.reduce((acc, curr) => acc ^ curr); },
 
   async sendCommand(cmd, args = []) {
+    // The endPointIn 'error' handler nulls endPointOut to mark the device as
+    // unusable. A transient poll error can fire between two awaited sendCommand
+    // calls, so re-check before each transfer to avoid a null .transfer() crash.
+    if (!this.endPointOut) {
+      throw new Error("endPointOut is null; device became unavailable");
+    }
     const promise = new Promise(resolve => {
       this.expectedReplies[this.lastRequestId] = resolve;
     });
@@ -492,12 +498,17 @@ ShizukuDevice.prototype = {
       this.endPointOut = null;
     });
 
-    DEBUG_log("sending CMD_STOP before we start sampling");
-    await this.sendCommand(this.CMD_STOP);
+    try {
+      DEBUG_log("sending CMD_STOP before we start sampling");
+      await this.sendCommand(this.CMD_STOP);
 
-    this.samplingRequestId = this.lastRequestId;
-    await this.sendCommand(this.CMD_START_SAMPLING,
-                           int32Bytes(this.samplingInterval));
+      this.samplingRequestId = this.lastRequestId;
+      await this.sendCommand(this.CMD_START_SAMPLING,
+                             int32Bytes(this.samplingInterval));
+    } catch (e) {
+      console.log("failed to start sampling:", e.message);
+      return;
+    }
     LogSampling();
   },
 
