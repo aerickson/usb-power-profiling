@@ -493,9 +493,15 @@ ShizukuDevice.prototype = {
     // blocked up to about 1.8s.
     this.endPointIn.startPoll(1024);
     this.endPointIn.on('data', data => this.ondata(data))
+    // startPoll can emit transient 'error' events before sampling has actually
+    // started; nulling endPointOut there would break the very next sendCommand.
+    // Gate the "mark device unavailable" behavior on isSampling so that only
+    // real mid-sampling errors kill the endpoint.
     this.endPointIn.on('error', err => {
       console.log("Error:", err);
-      this.endPointOut = null;
+      if (this.isSampling) {
+        this.endPointOut = null;
+      }
     });
 
     try {
@@ -505,6 +511,7 @@ ShizukuDevice.prototype = {
       this.samplingRequestId = this.lastRequestId;
       await this.sendCommand(this.CMD_START_SAMPLING,
                              int32Bytes(this.samplingInterval));
+      this.isSampling = true;
     } catch (e) {
       console.log("failed to start sampling:", e.message);
       return;
@@ -523,6 +530,7 @@ ShizukuDevice.prototype = {
     DEBUG_log("sending CMD_STOP");
     const stopPromise = this.sendCommand(this.CMD_STOP);
     this.endPointOut = null;
+    this.isSampling = false;
     await stopPromise;
 
     await new Promise(resolve => this.endPointIn.stopPoll(resolve));
