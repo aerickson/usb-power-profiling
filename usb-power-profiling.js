@@ -330,8 +330,47 @@ FnirsiDevice.prototype = {
 function ShizukuDevice(device) {
   this.endPointIn = null;
   this.endPointOut = null;
-  this.lastRequestId = 0;
+  // Start above the request IDs that appear in stale device-side replies
+  // we've observed at enumeration time (0x00, 0x01 — see fix #4 in
+  // usb_power_profiling_fork_fix_log.md). Avoids the case where our first
+  // sendCommand registers expectedReplies[0] just as a leftover reply with
+  // payload[2]==0x00 arrives and spuriously resolves it.
+  this.lastRequestId = 0x10;
   this.expectedReplies = {};
+  // Set when an asynchronous failure (poll error during sampling, or
+  // stopSampling) makes the device unusable. Replaces the older pattern
+  // of nulling endPointOut for that purpose so that an in-flight setup
+  // sequence can't be sabotaged by a transient event.
+  this.deviceUnavailable = false;
+  // Set true once startSampling has issued its first sendCommand. Used
+  // to drop stray reply-shaped payloads that arrive on endPointIn before
+  // we have actually asked for anything (otherwise they can spuriously
+  // resolve expectedReplies[lastRequestId] and we wrongly believe the
+  // device ack'd CMD_STOP / CMD_START_SAMPLING).
+  this.firstCommandSent = false;
+  defineEndPointOutTracer(this);
+}
+
+// Diagnostic: log a stack trace whenever endPointOut is cleared on a
+// ShizukuDevice instance. Removed once the remaining setup race
+// described in fix #4 of usb_power_profiling_fork_fix_log.md is closed.
+function defineEndPointOutTracer(obj) {
+  let backing = obj.endPointOut;
+  Object.defineProperty(obj, 'endPointOut', {
+    configurable: true,
+    enumerable: true,
+    get() { return backing; },
+    set(v) {
+      if (!v && backing) {
+        console.log(new Date(),
+                    "ShizukuDevice.endPointOut cleared; isSampling=" +
+                    !!obj.isSampling + " deviceUnavailable=" +
+                    !!obj.deviceUnavailable);
+        console.log(new Error("endPointOut cleared").stack);
+      }
+      backing = v;
+    },
+  });
 }
 
 ShizukuDevice.prototype = {
@@ -344,12 +383,16 @@ ShizukuDevice.prototype = {
   checksum(data) { return data.reduce((acc, curr) => acc ^ curr); },
 
   async sendCommand(cmd, args = []) {
-    // The endPointIn 'error' handler nulls endPointOut to mark the device as
-    // unusable. A transient poll error can fire between two awaited sendCommand
-    // calls, so re-check before each transfer to avoid a null .transfer() crash.
+    // Check both an absent endpoint (never set, or cleared by stopSampling)
+    // and the deviceUnavailable flag (set by the endPointIn 'error' handler
+    // during sampling). Either means we cannot issue commands.
     if (!this.endPointOut) {
       throw new Error("endPointOut is null; device became unavailable");
     }
+    if (this.deviceUnavailable) {
+      throw new Error("device marked unavailable; aborting sendCommand");
+    }
+    this.firstCommandSent = true;
     const promise = new Promise(resolve => {
       this.expectedReplies[this.lastRequestId] = resolve;
     });
@@ -408,6 +451,23 @@ ShizukuDevice.prototype = {
     if (data.length > minLength + length) {
       nextData = data.slice(minLength + length);
       DEBUG_log("next data", nextData);
+    }
+
+    // Drop reply-shaped payloads that arrive before we've issued any
+    // command. The YK-Lab Korona generic-vendor variant frequently sends
+    // a stale reply (`<Buffer 03 00 0X 80>`) immediately after enumeration;
+    // if a future sendCommand happens to assign lastRequestId == 0x0X,
+    // the stale reply spuriously resolves its promise and we believe the
+    // device ack'd a command it never received.
+    if (!this.firstCommandSent &&
+        payload.length == 4 &&
+        payload[3] == 0x80) {
+      DEBUG_log("dropping stray pre-command reply payload", payload);
+      if (nextData) {
+        DEBUG_log("processing next data");
+        this.ondata(nextData);
+      }
+      return;
     }
 
     // Check if we received a reply we were waiting for.
@@ -494,13 +554,18 @@ ShizukuDevice.prototype = {
     this.endPointIn.startPoll(1024);
     this.endPointIn.on('data', data => this.ondata(data))
     // startPoll can emit transient 'error' events before sampling has actually
-    // started; nulling endPointOut there would break the very next sendCommand.
-    // Gate the "mark device unavailable" behavior on isSampling so that only
-    // real mid-sampling errors kill the endpoint.
+    // started; marking the device unavailable there would break the very next
+    // sendCommand. Gate the "mark device unavailable" behavior on isSampling
+    // so that only real mid-sampling errors kill the endpoint. Use a flag
+    // instead of nulling endPointOut so an in-flight setup sequence can't be
+    // sabotaged by a transient event between findBulkInOutEndPoints and the
+    // first awaited sendCommand.
     this.endPointIn.on('error', err => {
-      console.log("Error:", err);
+      console.log(new Date(),
+                  "endPointIn error; isSampling=" + !!this.isSampling +
+                  " firstCommandSent=" + !!this.firstCommandSent + ":", err);
       if (this.isSampling) {
-        this.endPointOut = null;
+        this.deviceUnavailable = true;
       }
     });
 
@@ -520,7 +585,7 @@ ShizukuDevice.prototype = {
   },
 
   async stopSampling() {
-    if (!this.endPointOut) {
+    if (!this.endPointOut || this.deviceUnavailable) {
       if (DEBUG) {
         console.log("already in the process of stopping sampling");
       }
@@ -529,9 +594,14 @@ ShizukuDevice.prototype = {
 
     DEBUG_log("sending CMD_STOP");
     const stopPromise = this.sendCommand(this.CMD_STOP);
-    this.endPointOut = null;
+    // Mark unavailable BEFORE awaiting CMD_STOP so a re-entrant stopSampling
+    // (or any other sendCommand) bails out immediately. Defer nulling
+    // endPointOut until after CMD_STOP completes, since the in-flight
+    // sendCommand still needs the reference.
+    this.deviceUnavailable = true;
     this.isSampling = false;
     await stopPromise;
+    this.endPointOut = null;
 
     await new Promise(resolve => this.endPointIn.stopPoll(resolve));
     this.endPointIn = null;
