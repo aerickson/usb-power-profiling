@@ -330,12 +330,14 @@ FnirsiDevice.prototype = {
 function ShizukuDevice(device) {
   this.endPointIn = null;
   this.endPointOut = null;
-  // Start above the request IDs that appear in stale device-side replies
-  // we've observed at enumeration time (0x00, 0x01 — see fix #4 in
-  // usb_power_profiling_fork_fix_log.md). Avoids the case where our first
-  // sendCommand registers expectedReplies[0] just as a leftover reply with
-  // payload[2]==0x00 arrives and spuriously resolves it.
-  this.lastRequestId = 0x10;
+  // Randomize the request ID start so stale device-side replies from a
+  // prior session (which carry deterministic IDs — typically the last
+  // CMD_STOP/CMD_START_SAMPLING pair, e.g. 0x10/0x11 if the prior session
+  // also used a deterministic start) cannot reliably collide with the
+  // IDs we are about to use. With a uniform random byte the chance of
+  // any one stale reply spuriously resolving an in-flight expectedReplies
+  // entry is 1/256 per session rather than ~100% on the second command.
+  this.lastRequestId = Math.floor(Math.random() * 256);
   this.expectedReplies = {};
   // Set when an asynchronous failure (poll error during sampling, or
   // stopSampling) makes the device unusable. Replaces the older pattern
@@ -348,6 +350,15 @@ function ShizukuDevice(device) {
   // resolve expectedReplies[lastRequestId] and we wrongly believe the
   // device ack'd CMD_STOP / CMD_START_SAMPLING).
   this.firstCommandSent = false;
+  // Set while startSampling is executing. Allows stopSampling to detect
+  // a concurrent setup-in-progress and defer (rather than racing the
+  // in-flight sendCommand and setting deviceUnavailable mid-setup, which
+  // is what broke push 51af65211f4 — see fix #5 in
+  // usb_power_profiling_fork_fix_log.md).
+  this.isStarting = false;
+  // Set by stopSampling when called while isStarting is true. startSampling
+  // will honor it in its finally block.
+  this.pendingStopRequested = false;
   defineEndPointOutTracer(this);
 }
 
@@ -393,11 +404,32 @@ ShizukuDevice.prototype = {
       throw new Error("device marked unavailable; aborting sendCommand");
     }
     this.firstCommandSent = true;
-    const promise = new Promise(resolve => {
-      this.expectedReplies[this.lastRequestId] = resolve;
+    // Wrap to a single byte; the protocol field is one byte wide and any
+    // value above 0xff would be silently truncated when stuffed into the
+    // outgoing buffer, breaking expectedReplies matching.
+    const requestId = this.lastRequestId++ & 0xff;
+    // Bound the wait for a reply. Some Korona firmware states (notably
+    // when the prior session left the device in sampling mode) silently
+    // drop CMD_STOP and never reply, hanging this await forever. Failing
+    // fast lets startSampling's catch block clean up and lets the test
+    // framework's retry logic take over instead of waiting for a 240s
+    // Browsertime output timeout.
+    const REPLY_TIMEOUT_MS = 5000;
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        delete this.expectedReplies[requestId];
+        reject(new Error("sendCommand(0x" + cmd.toString(16) +
+                         ") timed out after " + REPLY_TIMEOUT_MS +
+                         "ms waiting for reply id=0x" +
+                         requestId.toString(16)));
+      }, REPLY_TIMEOUT_MS);
+      this.expectedReplies[requestId] = (...replyArgs) => {
+        clearTimeout(timer);
+        resolve(...replyArgs);
+      };
     });
     const COMMON_REQUEST_PREFIX = 0x1;
-    const data = [COMMON_REQUEST_PREFIX, cmd, this.lastRequestId++, 0, ...args];
+    const data = [COMMON_REQUEST_PREFIX, cmd, requestId, 0, ...args];
     DEBUG_log("sending command", Buffer.from(data));
     await sendBuffer(this.endPointOut,
                       Buffer.from([this.BEGIN_DATA,
@@ -522,69 +554,91 @@ ShizukuDevice.prototype = {
   },
 
   async startSampling() {
-    this.deviceName = this.deviceName.replace(/ in Application Mode$/, "");
+    this.isStarting = true;
+    try {
+      this.deviceName = this.deviceName.replace(/ in Application Mode$/, "");
 
-    // On Linux, detachKernelDriver() handles the cdc_acm conflict without a
-    // reset. A reset causes re-enumeration which fires a second 'attach' event
-    // and triggers a concurrent startSampling() call on the new handle.
-    if (process.platform !== 'linux') {
+      // On Linux, detachKernelDriver() handles the cdc_acm conflict without a
+      // reset. A reset causes re-enumeration which fires a second 'attach' event
+      // and triggers a concurrent startSampling() call on the new handle.
+      if (process.platform !== 'linux') {
+        try {
+          await resetDevice(this.device);
+        } catch(e) {
+          // resetDevice already logs the error.
+        }
+      }
+
       try {
-        await resetDevice(this.device);
+        [this.endPointIn, this.endPointOut] = findBulkInOutEndPoints(this.device);
       } catch(e) {
-        // resetDevice already logs the error.
+        console.log(e);
+      }
+
+      if (!this.endPointOut || !this.endPointIn) {
+        console.log("failed to find endpoints");
+        return;
+      }
+
+      // When sampling every 1ms, the default of keeping 3 data blocks pending
+      // in the kernel is not enough, as it's easy for our thread to be blocked
+      // for more than 3ms.
+      // 1024 is the maximum and allows us to recover if the main thread was
+      // blocked up to about 1.8s.
+      this.endPointIn.startPoll(1024);
+      this.endPointIn.on('data', data => this.ondata(data))
+      // startPoll can emit transient 'error' events before sampling has actually
+      // started; marking the device unavailable there would break the very next
+      // sendCommand. Gate the "mark device unavailable" behavior on isSampling
+      // so that only real mid-sampling errors kill the endpoint. Use a flag
+      // instead of nulling endPointOut so an in-flight setup sequence can't be
+      // sabotaged by a transient event between findBulkInOutEndPoints and the
+      // first awaited sendCommand.
+      this.endPointIn.on('error', err => {
+        console.log(new Date(),
+                    "endPointIn error; isSampling=" + !!this.isSampling +
+                    " firstCommandSent=" + !!this.firstCommandSent + ":", err);
+        if (this.isSampling) {
+          this.deviceUnavailable = true;
+        }
+      });
+
+      try {
+        DEBUG_log("sending CMD_STOP before we start sampling");
+        await this.sendCommand(this.CMD_STOP);
+
+        this.samplingRequestId = this.lastRequestId & 0xff;
+        await this.sendCommand(this.CMD_START_SAMPLING,
+                               int32Bytes(this.samplingInterval));
+        this.isSampling = true;
+      } catch (e) {
+        console.log("failed to start sampling:", e.message);
+        return;
+      }
+      LogSampling();
+    } finally {
+      this.isStarting = false;
+      // If a stopSampling call landed during setup it deferred to us. Honor
+      // it now that the in-flight sendCommand sequence is done (whether we
+      // succeeded, threw, or returned early on a missing endpoint).
+      if (this.pendingStopRequested) {
+        this.pendingStopRequested = false;
+        await this.stopSampling();
       }
     }
-
-    try {
-      [this.endPointIn, this.endPointOut] = findBulkInOutEndPoints(this.device);
-    } catch(e) {
-      console.log(e);
-    }
-
-    if (!this.endPointOut || !this.endPointIn) {
-      console.log("failed to find endpoints");
-      return;
-    }
-
-    // When sampling every 1ms, the default of keeping 3 data blocks pending
-    // in the kernel is not enough, as it's easy for our thread to be blocked
-    // for more than 3ms.
-    // 1024 is the maximum and allows us to recover if the main thread was
-    // blocked up to about 1.8s.
-    this.endPointIn.startPoll(1024);
-    this.endPointIn.on('data', data => this.ondata(data))
-    // startPoll can emit transient 'error' events before sampling has actually
-    // started; marking the device unavailable there would break the very next
-    // sendCommand. Gate the "mark device unavailable" behavior on isSampling
-    // so that only real mid-sampling errors kill the endpoint. Use a flag
-    // instead of nulling endPointOut so an in-flight setup sequence can't be
-    // sabotaged by a transient event between findBulkInOutEndPoints and the
-    // first awaited sendCommand.
-    this.endPointIn.on('error', err => {
-      console.log(new Date(),
-                  "endPointIn error; isSampling=" + !!this.isSampling +
-                  " firstCommandSent=" + !!this.firstCommandSent + ":", err);
-      if (this.isSampling) {
-        this.deviceUnavailable = true;
-      }
-    });
-
-    try {
-      DEBUG_log("sending CMD_STOP before we start sampling");
-      await this.sendCommand(this.CMD_STOP);
-
-      this.samplingRequestId = this.lastRequestId;
-      await this.sendCommand(this.CMD_START_SAMPLING,
-                             int32Bytes(this.samplingInterval));
-      this.isSampling = true;
-    } catch (e) {
-      console.log("failed to start sampling:", e.message);
-      return;
-    }
-    LogSampling();
   },
 
   async stopSampling() {
+    // If startSampling is mid-flight, racing it would set deviceUnavailable
+    // while it still expects to issue sendCommand calls (the failure mode
+    // observed in push 51af65211f4). Defer to startSampling's finally block.
+    if (this.isStarting) {
+      if (DEBUG) {
+        console.log("stopSampling deferred: startSampling is in flight");
+      }
+      this.pendingStopRequested = true;
+      return;
+    }
     if (!this.endPointOut || this.deviceUnavailable) {
       if (DEBUG) {
         console.log("already in the process of stopping sampling");
