@@ -19,7 +19,7 @@ const WITRN_VENDOR_ID = 0x716;
 const RUIDENG_VENDOR_ID = 0x28e9;
 const YZXSTUDIO_VENDOR_ID = 0x1a86;
 
-const DEBUG = false;//true;
+const DEBUG = true;//false;
 const DEBUG_log = DEBUG ? console.log : () => {};
 
 const MAX_SAMPLES = 4000000; // About 1.5h at 1kHz.
