@@ -19,7 +19,7 @@ const WITRN_VENDOR_ID = 0x716;
 const RUIDENG_VENDOR_ID = 0x28e9;
 const YZXSTUDIO_VENDOR_ID = 0x1a86;
 
-const DEBUG = true;//false;
+const DEBUG = false;//true;
 const DEBUG_log = DEBUG ? console.log : () => {};
 
 const MAX_SAMPLES = 4000000; // About 1.5h at 1kHz.
@@ -393,7 +393,15 @@ ShizukuDevice.prototype = {
 
   checksum(data) { return data.reduce((acc, curr) => acc ^ curr); },
 
-  async sendCommand(cmd, args = []) {
+  // Bound the wait for a reply. Korona firmware sometimes takes
+  // ~100s to reply to CMD_STOP (real reply IDs were observed arriving
+  // 100+ seconds after the send across push 45976297e29...). For
+  // commands whose reply we actually need, fail fast and let the
+  // caller handle it. CMD_STOP itself is now sent fire-and-forget
+  // because awaiting its reply was the dominant failure mode.
+  REPLY_TIMEOUT_MS: 5000,
+
+  async sendCommand(cmd, args = [], { awaitReply = true } = {}) {
     // Check both an absent endpoint (never set, or cleared by stopSampling)
     // and the deviceUnavailable flag (set by the endPointIn 'error' handler
     // during sampling). Either means we cannot issue commands.
@@ -408,29 +416,26 @@ ShizukuDevice.prototype = {
     // value above 0xff would be silently truncated when stuffed into the
     // outgoing buffer, breaking expectedReplies matching.
     const requestId = this.lastRequestId++ & 0xff;
-    // Bound the wait for a reply. Some Korona firmware states (notably
-    // when the prior session left the device in sampling mode) silently
-    // drop CMD_STOP and never reply, hanging this await forever. Failing
-    // fast lets startSampling's catch block clean up and lets the test
-    // framework's retry logic take over instead of waiting for a 240s
-    // Browsertime output timeout.
-    const REPLY_TIMEOUT_MS = 5000;
-    const promise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        delete this.expectedReplies[requestId];
-        reject(new Error("sendCommand(0x" + cmd.toString(16) +
-                         ") timed out after " + REPLY_TIMEOUT_MS +
-                         "ms waiting for reply id=0x" +
-                         requestId.toString(16)));
-      }, REPLY_TIMEOUT_MS);
-      this.expectedReplies[requestId] = (...replyArgs) => {
-        clearTimeout(timer);
-        resolve(...replyArgs);
-      };
-    });
+    let promise;
+    if (awaitReply) {
+      promise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          delete this.expectedReplies[requestId];
+          reject(new Error("sendCommand(0x" + cmd.toString(16) +
+                           ") timed out after " + this.REPLY_TIMEOUT_MS +
+                           "ms waiting for reply id=0x" +
+                           requestId.toString(16)));
+        }, this.REPLY_TIMEOUT_MS);
+        this.expectedReplies[requestId] = (...replyArgs) => {
+          clearTimeout(timer);
+          resolve(...replyArgs);
+        };
+      });
+    }
     const COMMON_REQUEST_PREFIX = 0x1;
     const data = [COMMON_REQUEST_PREFIX, cmd, requestId, 0, ...args];
-    DEBUG_log("sending command", Buffer.from(data));
+    DEBUG_log("sending command", Buffer.from(data),
+              awaitReply ? "(awaiting reply)" : "(fire-and-forget)");
     await sendBuffer(this.endPointOut,
                       Buffer.from([this.BEGIN_DATA,
                                    ...int32Bytes(data.length), ...data,
@@ -604,8 +609,24 @@ ShizukuDevice.prototype = {
       });
 
       try {
-        DEBUG_log("sending CMD_STOP before we start sampling");
-        await this.sendCommand(this.CMD_STOP);
+        // Fire-and-forget CMD_STOP. Awaiting its reply was the dominant
+        // failure mode on push 45976297e29... — Korona firmware took
+        // ~100s to reply on this generic-vendor variant, far past any
+        // useful timeout. We don't need the reply: CMD_STOP just resets
+        // the device's internal state, and any late reply that lands
+        // after this point will be filed under "ignoring unexpected
+        // payload" (its requestId won't be in expectedReplies). We
+        // still need the buffer to actually go out before the next
+        // command, so we await sendBuffer (which is what sendCommand's
+        // outer await covers when awaitReply=false).
+        DEBUG_log("sending CMD_STOP (fire-and-forget) before we start sampling");
+        await this.sendCommand(this.CMD_STOP, [], { awaitReply: false });
+
+        // Yield once so any in-flight ondata callbacks (including stale
+        // replies from the prior session) can run before we register
+        // expectedReplies for CMD_START_SAMPLING and put our id at risk
+        // of a spurious match.
+        await new Promise(resolve => setImmediate(resolve));
 
         this.samplingRequestId = this.lastRequestId & 0xff;
         await this.sendCommand(this.CMD_START_SAMPLING,
@@ -646,12 +667,16 @@ ShizukuDevice.prototype = {
       return;
     }
 
-    DEBUG_log("sending CMD_STOP");
-    const stopPromise = this.sendCommand(this.CMD_STOP);
-    // Mark unavailable BEFORE awaiting CMD_STOP so a re-entrant stopSampling
-    // (or any other sendCommand) bails out immediately. Defer nulling
-    // endPointOut until after CMD_STOP completes, since the in-flight
-    // sendCommand still needs the reference.
+    DEBUG_log("sending CMD_STOP (fire-and-forget) for shutdown");
+    // Fire-and-forget: see startSampling for the rationale. The Korona
+    // firmware reply latency for CMD_STOP makes awaiting useless, and
+    // we are tearing down anyway.
+    const stopPromise = this.sendCommand(this.CMD_STOP, [],
+                                         { awaitReply: false });
+    // Mark unavailable BEFORE awaiting sendBuffer so a re-entrant
+    // stopSampling (or any other sendCommand) bails out immediately.
+    // Defer nulling endPointOut until after the buffer transfer, since
+    // sendBuffer still needs the reference.
     this.deviceUnavailable = true;
     this.isSampling = false;
     await stopPromise;
