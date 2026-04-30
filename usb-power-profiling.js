@@ -1264,6 +1264,18 @@ async function tryDevice(device) {
       if (envSerialNumber && dev.serialNumber != envSerialNumber) {
         console.log("Not sampling this power meter as its serial number is not " +
                     envSerialNumber);
+        // Close the device handle since we are not going to use it. In
+        // multi-tenant deployments where N containers each bind-mount all
+        // N meters, leaving the handle open keeps the meter's USB device
+        // state machine juggling N concurrent host-side handles for its
+        // entire session — for cheap meter firmware this is plausibly a
+        // source of the unstable response latency we observe. See fix #7
+        // in usb_power_profiling_fork_fix_log.md.
+        try {
+          device.close();
+        } catch(e) {
+          console.log("device.close() failed for non-target meter:", e);
+        }
         return;
       }
       dev.device = device;
